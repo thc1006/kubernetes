@@ -4486,6 +4486,10 @@ func TestAllocatorSelection(t *testing.T) {
 			features:             "AllAlpha=false,AllBeta=false,DRAPartitionableDevices=true",
 			expectImplementation: "stable",
 		},
+		"FractionalCapacityRange": {
+			features:             "AllAlpha=false,AllBeta=false,DRAConsumableCapacity=true,DRAFractionalCapacityRange=true",
+			expectImplementation: "incubating",
+		},
 		"PrioritizedList": {
 			features:             "AllAlpha=false,AllBeta=false,DRAPrioritizedList=true",
 			expectImplementation: "stable",
