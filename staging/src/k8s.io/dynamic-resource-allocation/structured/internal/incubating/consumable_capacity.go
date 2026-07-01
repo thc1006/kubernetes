@@ -27,7 +27,7 @@ import (
 // CmpRequestOverCapacity checks whether the new capacity request can be added within the given capacity,
 // and checks whether the requested value is against the capacity requestPolicy.
 func CmpRequestOverCapacity(currentConsumedCapacity ConsumedCapacity, deviceRequestCapacity *resourceapi.CapacityRequirements,
-	allowMultipleAllocations *bool, capacity map[resourceapi.QualifiedName]resourceapi.DeviceCapacity, allocatingCapacity ConsumedCapacity) (bool, error) {
+	allowMultipleAllocations *bool, capacity map[resourceapi.QualifiedName]resourceapi.DeviceCapacity, allocatingCapacity ConsumedCapacity, fractionalCapacityRange bool) (bool, error) {
 	if requestsContainNonExistCapacity(deviceRequestCapacity, capacity) {
 		return false, errors.New("some requested capacity has not been defined")
 	}
@@ -39,8 +39,8 @@ func CmpRequestOverCapacity(currentConsumedCapacity ConsumedCapacity, deviceRequ
 				requestedValPtr = &requestedVal
 			}
 		}
-		consumedCapacity := calculateConsumedCapacity(requestedValPtr, cap)
-		if violatesPolicy(consumedCapacity, cap.RequestPolicy) {
+		consumedCapacity := calculateConsumedCapacity(requestedValPtr, cap, fractionalCapacityRange)
+		if violatesPolicy(consumedCapacity, cap.RequestPolicy, fractionalCapacityRange) {
 			return false, nil
 		}
 		// If the current clone already contains an entry for this capacity, add the consumedCapacity to it.
@@ -80,7 +80,7 @@ func requestsContainNonExistCapacity(deviceRequestCapacity *resourceapi.Capacity
 // If no requestPolicy, return capacity.Value.
 // If no requestVal, fill the quantity by fillEmptyRequest function
 // Otherwise, use requestPolicy to calculate the consumed capacity from request if applicable.
-func calculateConsumedCapacity(requestedVal *resource.Quantity, capacity resourceapi.DeviceCapacity) resource.Quantity {
+func calculateConsumedCapacity(requestedVal *resource.Quantity, capacity resourceapi.DeviceCapacity, fractionalCapacityRange bool) resource.Quantity {
 	if requestedVal == nil {
 		return fillEmptyRequest(capacity)
 	}
@@ -89,7 +89,7 @@ func calculateConsumedCapacity(requestedVal *resource.Quantity, capacity resourc
 	}
 	switch {
 	case capacity.RequestPolicy.ValidRange != nil && capacity.RequestPolicy.ValidRange.Min != nil:
-		return roundUpRange(requestedVal, capacity.RequestPolicy.ValidRange)
+		return roundUpRange(requestedVal, capacity.RequestPolicy.ValidRange, fractionalCapacityRange)
 	case capacity.RequestPolicy.ValidValues != nil:
 		return roundUpValidValues(requestedVal, capacity.RequestPolicy.ValidValues)
 	}
@@ -111,24 +111,46 @@ func fillEmptyRequest(capacity resourceapi.DeviceCapacity) resource.Quantity {
 //   - If Step is specified, it rounds requestedVal up to the nearest multiple of Step
 //     starting from Min.
 //   - If no Step is specified and requestedVal >= Min, it returns requestedVal as is.
-func roundUpRange(requestedVal *resource.Quantity, validRange *resourceapi.CapacityRequestPolicyRange) resource.Quantity {
+//
+// When fractionalCapacityRange is true and any of min/max/step are fractional and all
+// fit within the milli-value int64 range and step >= 1m, milli-value arithmetic is used.
+// Otherwise Value() arithmetic is used.
+func roundUpRange(requestedVal *resource.Quantity, validRange *resourceapi.CapacityRequestPolicyRange, fractionalCapacityRange bool) resource.Quantity {
 	if requestedVal.Cmp(*validRange.Min) < 0 {
 		return validRange.Min.DeepCopy()
 	}
 	if validRange.Step == nil {
 		return *requestedVal
 	}
-	requestedInt64 := requestedVal.Value()
-	step := validRange.Step.Value()
-	min := validRange.Min.Value()
-	added := (requestedInt64 - min)
-	n := added / step
-	mod := added % step
-	if mod != 0 {
-		n += 1
+	if useMilli(validRange, fractionalCapacityRange) {
+		requestedMilli := requestedVal.MilliValue()
+		stepMilli := validRange.Step.MilliValue()
+		minMilli := validRange.Min.MilliValue()
+		addedMilli := requestedMilli - minMilli
+		n := addedMilli / stepMilli
+		if addedMilli%stepMilli != 0 {
+			n++
+		}
+		valMilli := minMilli + stepMilli*n
+		// Return in the same format as the step quantity. If the result is a
+		// whole number, use NewQuantity to keep the representation compact and
+		// compatible with quantities parsed from whole-number strings.
+		format := validRange.Step.Format
+		if valMilli%1000 == 0 {
+			return *resource.NewQuantity(valMilli/1000, format)
+		}
+		return *resource.NewMilliQuantity(valMilli, format)
 	}
-	val := min + step*n
-	return *resource.NewQuantity(val, resource.BinarySI)
+	// Integer arithmetic path.
+	requestedInt := requestedVal.Value()
+	stepInt := validRange.Step.Value()
+	minInt := validRange.Min.Value()
+	added := requestedInt - minInt
+	n := added / stepInt
+	if added%stepInt != 0 {
+		n++
+	}
+	return *resource.NewQuantity(minInt+stepInt*n, validRange.Step.Format)
 }
 
 // roundUpValidValues returns the first value in validValues that is greater than or equal to requestedVal.
@@ -148,7 +170,7 @@ func roundUpValidValues(requestedVal *resource.Quantity, validValues []resource.
 // GetConsumedCapacityFromRequest returns valid consumed capacity,
 // according to claim request and defined capacity.
 func GetConsumedCapacityFromRequest(requestedCapacity *resourceapi.CapacityRequirements,
-	consumableCapacity map[resourceapi.QualifiedName]resourceapi.DeviceCapacity) map[resourceapi.QualifiedName]resource.Quantity {
+	consumableCapacity map[resourceapi.QualifiedName]resourceapi.DeviceCapacity, fractionalCapacityRange bool) map[resourceapi.QualifiedName]resource.Quantity {
 	consumedCapacity := make(map[resourceapi.QualifiedName]resource.Quantity)
 	for name, cap := range consumableCapacity {
 		var requestedValPtr *resource.Quantity
@@ -157,14 +179,14 @@ func GetConsumedCapacityFromRequest(requestedCapacity *resourceapi.CapacityRequi
 				requestedValPtr = &requestedVal
 			}
 		}
-		capacity := calculateConsumedCapacity(requestedValPtr, cap)
+		capacity := calculateConsumedCapacity(requestedValPtr, cap, fractionalCapacityRange)
 		consumedCapacity[name] = capacity
 	}
 	return consumedCapacity
 }
 
 // violatesPolicy checks whether the request violate the requestPolicy.
-func violatesPolicy(requestedVal resource.Quantity, policy *resourceapi.CapacityRequestPolicy) bool {
+func violatesPolicy(requestedVal resource.Quantity, policy *resourceapi.CapacityRequestPolicy, fractionalCapacityRange bool) bool {
 	if policy == nil {
 		// no policy to check
 		return false
@@ -174,7 +196,7 @@ func violatesPolicy(requestedVal resource.Quantity, policy *resourceapi.Capacity
 	}
 	switch {
 	case policy.ValidRange != nil:
-		return violateValidRange(requestedVal, *policy.ValidRange)
+		return violateValidRange(requestedVal, *policy.ValidRange, fractionalCapacityRange)
 	case len(policy.ValidValues) > 0:
 		return violateValidValues(requestedVal, policy.ValidValues)
 	}
@@ -182,23 +204,57 @@ func violatesPolicy(requestedVal resource.Quantity, policy *resourceapi.Capacity
 	return false
 }
 
-func violateValidRange(requestedVal resource.Quantity, validRange resourceapi.CapacityRequestPolicyRange) bool {
+func violateValidRange(requestedVal resource.Quantity, validRange resourceapi.CapacityRequestPolicyRange, fractionalCapacityRange bool) bool {
 	if validRange.Max != nil &&
 		requestedVal.Cmp(*validRange.Max) > 0 {
 		return true
 	}
 	if validRange.Step != nil {
-		requestedInt64 := requestedVal.Value()
-		step := validRange.Step.Value()
-		min := validRange.Min.Value()
-		added := (requestedInt64 - min)
-		mod := added % step
-		// must be a multiply of step
-		if mod != 0 {
+		var requested, step, min int64
+		if useMilli(&validRange, fractionalCapacityRange) {
+			requested = requestedVal.MilliValue()
+			step = validRange.Step.MilliValue()
+			min = validRange.Min.MilliValue()
+		} else {
+			requested = requestedVal.Value()
+			step = validRange.Step.Value()
+			min = validRange.Min.Value()
+		}
+		// must be a multiple of step from min
+		if (requested-min)%step != 0 {
 			return true
 		}
 	}
 	return false
+}
+
+// useMilli reports whether milli-value arithmetic should be used for the given range.
+// Conditions: fractionalCapacityRange enabled AND any of min/max/step is fractional
+// AND all non-nil fields fit within the milli-value int64 range AND step >= 1m.
+func useMilli(validRange *resourceapi.CapacityRequestPolicyRange, fractionalCapacityRange bool) bool {
+	if !fractionalCapacityRange {
+		return false
+	}
+	hasFractional := false
+	for _, q := range []*resource.Quantity{validRange.Min, validRange.Max, validRange.Step} {
+		if q == nil {
+			continue
+		}
+		if q.Value() > resource.MaxMilliValue {
+			return false
+		}
+		if q.MilliValue()%1000 != 0 {
+			hasFractional = true
+		}
+	}
+	if !hasFractional {
+		return false
+	}
+	// Step must be at least 1m.
+	if validRange.Step != nil && validRange.Step.MilliValue() < 1 {
+		return false
+	}
+	return true
 }
 
 func violateValidValues(requestedVal resource.Quantity, validValues []resource.Quantity) bool {
