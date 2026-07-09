@@ -25,8 +25,10 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	grpcstats "google.golang.org/grpc/stats"
+	"google.golang.org/grpc/status"
 
 	v1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
@@ -395,6 +397,14 @@ func (pm *DRAPluginManager) add(driverName string, endpoint string, chosenServic
 				logger.V(4).Info("Attempting to start WatchResources health stream")
 				stream, err := p.NodeWatchResources(ctx)
 				if err != nil {
+					// The driver does not implement the optional health service.
+					// Retrying cannot succeed, so stop the watch instead of
+					// re-establishing the stream every period.
+					if status.Code(err) == codes.Unimplemented {
+						logger.V(2).Info("Driver does not implement DRA health monitoring, stopping health watch")
+						streamCancel()
+						return
+					}
 					logger.V(3).Info("Failed to establish WatchResources stream, will retry", "err", err)
 					return
 				}
@@ -402,6 +412,12 @@ func (pm *DRAPluginManager) add(driverName string, endpoint string, chosenServic
 				logger.V(2).Info("Successfully started WatchResources health stream")
 
 				err = pm.streamHandler.HandleWatchResourcesStream(ctx, stream, driverName)
+				// A lazily-created stream surfaces Unimplemented on the first
+				// Recv rather than at NodeWatchResources; stop retrying here too.
+				if status.Code(err) == codes.Unimplemented {
+					streamCancel()
+					return
+				}
 				logger.V(2).Info("WatchResources health stream has ended", "error", err)
 
 			}, 5*time.Second)

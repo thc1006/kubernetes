@@ -26,6 +26,8 @@ import (
 	"strconv"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	v1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1055,6 +1057,15 @@ func (m *Manager) HandleWatchResourcesStream(ctx context.Context, stream draheal
 			if errors.Is(err, io.EOF) {
 				logger.V(4).Info("Stream ended with EOF")
 				return nil
+			}
+			// The driver does not implement the optional health service. This is
+			// a permanent condition for this connection, so log it at low
+			// verbosity instead of as an unexpected error, and propagate it so
+			// the caller can stop retrying. The watch restarts if the plugin
+			// re-registers.
+			if status.Code(err) == codes.Unimplemented {
+				logger.V(2).Info("Driver does not implement DRA health monitoring, stopping health updates for this driver")
+				return err
 			}
 			// Other errors are unexpected, log & return.
 			logger.Error(err, "Error receiving from WatchResources stream")

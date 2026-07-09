@@ -34,7 +34,9 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 
 	v1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
@@ -2133,6 +2135,40 @@ func TestHandleWatchResourcesStream(t *testing.T) {
 
 		require.Error(t, actualErr, "HandleWatchResourcesStream should have returned an error")
 		assert.ErrorIs(t, actualErr, expectedStreamErr)
+	})
+
+	// Test Case: driver does not implement the optional health service.
+	// The Unimplemented status must be propagated to the caller (which relies on
+	// it to stop retrying) and must not be swallowed or altered.
+	t.Run("StreamUnimplemented", func(t *testing.T) {
+		stCtx, stCancel := context.WithCancel(overallTestCtx)
+		defer stCancel()
+
+		_, runStreamTest := setupNewManagerAndRunStreamTest(t, stCtx)
+		t.Log("StreamUnimplemented: Test Case Started")
+
+		responses := make(chan struct {
+			Resp *drahealthv1alpha1.NodeWatchResourcesResponse
+			Err  error
+		}, 1)
+		_, done, streamErrChan := runStreamTest(stCtx, responses)
+
+		unimplementedErr := status.Error(codes.Unimplemented, "unknown service v1alpha1.DRAResourceHealth")
+		responses <- struct {
+			Resp *drahealthv1alpha1.NodeWatchResourcesResponse
+			Err  error
+		}{Err: unimplementedErr}
+
+		var actualErr error
+		select {
+		case <-done:
+			actualErr = <-streamErrChan
+		case <-time.After(2 * time.Second):
+			t.Fatal("StreamUnimplemented: Timeout waiting for stream handler to finish")
+		}
+
+		require.Error(t, actualErr, "HandleWatchResourcesStream should return the Unimplemented error")
+		assert.Equal(t, codes.Unimplemented, status.Code(actualErr), "Unimplemented must be propagated unchanged to the caller")
 	})
 
 	// Test Case 5: Context cancellation
