@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
@@ -1431,7 +1430,7 @@ func stringKey(item string) string {
 
 // quantityKey uses the item itself as a key for validateSet.
 func quantityKey(item apiresource.Quantity) string {
-	return strconv.FormatInt(item.Value(), 10)
+	return item.AsDec().String()
 }
 
 // validateMap validates keys, items and the maximum length of a map.
