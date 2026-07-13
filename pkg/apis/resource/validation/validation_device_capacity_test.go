@@ -57,6 +57,10 @@ func TestValidateDeviceCapacity(t *testing.T) {
 	oneKIAbbreviated := apiresource.MustParse("1Ki")
 	oneKIUnabbreviated := apiresource.MustParse("1024")
 
+	hundredMilli := apiresource.MustParse("100m")
+	twoHundredMilli := apiresource.MustParse("200m")
+	oneUnit := apiresource.MustParse("1")
+
 	one := apiresource.MustParse("1Gi")
 	two := apiresource.MustParse("2Gi")
 	maxCapacity := apiresource.MustParse("10Gi")
@@ -131,6 +135,10 @@ func TestValidateDeviceCapacity(t *testing.T) {
 				field.Invalid(validValuesField.Index(0), "20Gi", "option is larger than capacity value: 10Gi"),
 				field.Invalid(validValuesField, "1Gi", "default value is not valid according to the requestPolicy"),
 			},
+		},
+		"valid-fractional-values": {
+			// 100m (0.1), 200m (0.2), 1 are ascending, all ≤ maxCapacity; AsDec normalises them distinctly
+			capacity: testDeviceCapacity(maxCapacity, testCapacityRequestPolicy(&hundredMilli, []apiresource.Quantity{hundredMilli, twoHundredMilli, oneUnit}, nil)),
 		},
 		"invalid-options-duplicate": {
 			capacity: testDeviceCapacity(maxCapacity, testCapacityRequestPolicy(&one, []apiresource.Quantity{one, one}, nil)),
