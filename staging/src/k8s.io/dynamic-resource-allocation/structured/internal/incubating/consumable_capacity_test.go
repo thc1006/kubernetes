@@ -303,3 +303,39 @@ func testCalculateConsumedCapacity(t *testing.T) {
 		})
 	}
 }
+
+// TestRoundUpRangeIntegerOverflow guards the integer arithmetic path of roundUpRange
+// against int64 overflow. Rounding up to min+step*n, or reading an operand through
+// Quantity.Value(), previously overflowed or truncated int64 and wrapped the rounded
+// capacity to a negative value for large quantities.
+// Regression test for https://github.com/kubernetes/kubernetes/issues/140441.
+func TestRoundUpRangeIntegerOverflow(t *testing.T) {
+	zero := resource.MustParse("0")
+	for name, tc := range map[string]struct {
+		step, request, want resource.Quantity
+	}{
+		// min+step*n overflows int64 even though every operand fits in int64:
+		// ceil(6E/5E) = 2, and 2*5E = 10E = 1e19, which is greater than MaxInt64.
+		"result overflows int64": {
+			step:    resource.MustParse("5E"),
+			request: resource.MustParse("6E"),
+			want:    resource.MustParse("10E"),
+		},
+		// operands exceed int64, so Value() would truncate them:
+		// ceil(150E/100E) = 2, and 2*100E = 200E.
+		"operands exceed int64": {
+			step:    resource.MustParse("100E"),
+			request: resource.MustParse("150E"),
+			want:    resource.MustParse("200E"),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := NewWithT(t)
+			validRange := &resourceapi.CapacityRequestPolicyRange{Min: &zero, Step: &tc.step}
+			got := roundUpRange(&tc.request, validRange, false)
+			g.Expect(got.Sign()).To(BeNumerically(">", 0), "rounded capacity wrapped negative: %s", got.String())
+			g.Expect(got.Cmp(tc.request)).To(BeNumerically(">=", 0), "rounded capacity %s is less than request %s", got.String(), tc.request.String())
+			g.Expect(got.Cmp(tc.want)).To(BeZero(), "got %s, want %s", got.String(), tc.want.String())
+		})
+	}
+}

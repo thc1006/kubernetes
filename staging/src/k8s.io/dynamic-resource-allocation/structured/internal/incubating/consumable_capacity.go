@@ -18,7 +18,9 @@ package incubating
 
 import (
 	"errors"
+	"math"
 
+	"gopkg.in/inf.v0"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/utils/ptr"
@@ -141,16 +143,37 @@ func roundUpRange(requestedVal *resource.Quantity, validRange *resourceapi.Capac
 		}
 		return *resource.NewMilliQuantity(valMilli, format)
 	}
-	// Integer arithmetic path.
-	requestedInt := requestedVal.Value()
-	stepInt := validRange.Step.Value()
-	minInt := validRange.Min.Value()
-	added := requestedInt - minInt
-	n := added / stepInt
-	if added%stepInt != 0 {
-		n++
+	// Integer arithmetic path. Prefer the int64 fast path, which preserves the
+	// canonical (integer) representation of in-range results; fall back to
+	// arbitrary-precision arithmetic when an operand does not fit int64 (Value()
+	// would truncate) or when min+step*n would overflow, so large capacities round
+	// up correctly instead of wrapping negative. The fast path requires Min >= 0
+	// (with requestedVal >= Min, checked above) so that added and the
+	// (maxI64 - minInt) guard cannot overflow.
+	maxI64 := int64(math.MaxInt64)
+	if validRange.Min.Sign() >= 0 &&
+		requestedVal.CmpInt64(maxI64) <= 0 &&
+		validRange.Step.CmpInt64(maxI64) <= 0 &&
+		validRange.Min.CmpInt64(maxI64) <= 0 {
+		requestedInt := requestedVal.Value()
+		stepInt := validRange.Step.Value()
+		minInt := validRange.Min.Value()
+		added := requestedInt - minInt
+		n := added / stepInt
+		if added%stepInt != 0 {
+			n++
+		}
+		if n == 0 || stepInt <= (maxI64-minInt)/n {
+			return *resource.NewQuantity(minInt+stepInt*n, validRange.Step.Format)
+		}
 	}
-	return *resource.NewQuantity(minInt+stepInt*n, validRange.Step.Format)
+	requestedDec := requestedVal.AsDec()
+	stepDec := validRange.Step.AsDec()
+	minDec := validRange.Min.AsDec()
+	addedDec := new(inf.Dec).Sub(requestedDec, minDec)
+	n := new(inf.Dec).QuoRound(addedDec, stepDec, 0, inf.RoundCeil)
+	result := new(inf.Dec).Add(minDec, new(inf.Dec).Mul(stepDec, n))
+	return *resource.NewDecimalQuantity(*result, validRange.Step.Format)
 }
 
 // roundUpValidValues returns the first value in validValues that is greater than or equal to requestedVal.
