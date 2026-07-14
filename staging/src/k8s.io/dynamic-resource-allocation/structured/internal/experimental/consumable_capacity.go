@@ -18,7 +18,9 @@ package experimental
 
 import (
 	"errors"
+	"math"
 
+	inf "gopkg.in/inf.v0"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/utils/ptr"
@@ -122,35 +124,79 @@ func roundUpRange(requestedVal *resource.Quantity, validRange *resourceapi.Capac
 	if validRange.Step == nil {
 		return *requestedVal
 	}
+	format := validRange.Step.Format
 	if useMilli(validRange, fractionalCapacityRange) {
-		requestedMilli := requestedVal.MilliValue()
-		stepMilli := validRange.Step.MilliValue()
-		minMilli := validRange.Min.MilliValue()
-		added := requestedMilli - minMilli
-		n := added / stepMilli
-		if added%stepMilli != 0 {
-			n++
+		// useMilli bounds Min/Max/Step to MaxMilliValue, but not the request.
+		// If the request is too large for an exact MilliValue(), or the rounded
+		// value would overflow int64, fall back to exact arithmetic.
+		if fitsMilliValue(requestedVal) {
+			requestedMilli := requestedVal.MilliValue()
+			stepMilli := validRange.Step.MilliValue()
+			minMilli := validRange.Min.MilliValue()
+			addedMilli := requestedMilli - minMilli
+			n := addedMilli / stepMilli
+			if addedMilli%stepMilli != 0 {
+				n++
+			}
+			if valMilli, ok := safeMinPlusStepN(minMilli, stepMilli, n); ok {
+				// Return in the same format as the step quantity. If the result is a
+				// whole number, use NewQuantity to keep the representation compact and
+				// compatible with quantities parsed from whole-number strings.
+				if valMilli%1000 == 0 {
+					return *resource.NewQuantity(valMilli/1000, format)
+				}
+				return *resource.NewMilliQuantity(valMilli, format)
+			}
 		}
-		valMilli := minMilli + stepMilli*n
-		// Return in the same format as the step quantity. If the result is a
-		// whole number, use NewQuantity to keep the representation compact and
-		// compatible with quantities parsed from whole-number strings.
-		format := validRange.Step.Format
-		if valMilli%1000 == 0 {
-			return *resource.NewQuantity(valMilli/1000, format)
+		return roundUpRangeArbitrary(requestedVal, validRange.Min, validRange.Step, format)
+	}
+	// Integer arithmetic path, guarded against int64 overflow and against a step
+	// whose Value() is 0 (a quantity larger than MaxInt64, e.g. "100E").
+	if fitsInt64Value(requestedVal) && fitsInt64Value(validRange.Min) && fitsInt64Value(validRange.Step) {
+		if stepInt := validRange.Step.Value(); stepInt > 0 {
+			requestedInt := requestedVal.Value()
+			minInt := validRange.Min.Value()
+			added := requestedInt - minInt
+			n := added / stepInt
+			if added%stepInt != 0 {
+				n++
+			}
+			if val, ok := safeMinPlusStepN(minInt, stepInt, n); ok {
+				return *resource.NewQuantity(val, format)
+			}
 		}
-		return *resource.NewMilliQuantity(valMilli, format)
 	}
-	// Integer arithmetic path.
-	requestedInt := requestedVal.Value()
-	stepInt := validRange.Step.Value()
-	minInt := validRange.Min.Value()
-	added := requestedInt - minInt
-	n := added / stepInt
-	if added%stepInt != 0 {
-		n++
+	return roundUpRangeArbitrary(requestedVal, validRange.Min, validRange.Step, format)
+}
+
+// fitsInt64Value reports whether q is non-negative and small enough that q.Value()
+// is exact. A quantity larger than MaxInt64 wraps, for example "100E".Value() == 0.
+func fitsInt64Value(q *resource.Quantity) bool {
+	return q.Sign() >= 0 && q.CmpInt64(math.MaxInt64) <= 0
+}
+
+// fitsMilliValue reports whether q.MilliValue() is exact, i.e. q*1000 does not overflow int64.
+func fitsMilliValue(q *resource.Quantity) bool {
+	return q.Sign() >= 0 && q.CmpInt64(resource.MaxMilliValue) <= 0
+}
+
+// safeMinPlusStepN returns base+step*n and reports whether that int64 computation
+// stays within range. base, step and n are assumed non-negative.
+func safeMinPlusStepN(base, step, n int64) (int64, bool) {
+	if n != 0 && step > (math.MaxInt64-base)/n {
+		return 0, false
 	}
-	return *resource.NewQuantity(minInt+stepInt*n, validRange.Step.Format)
+	return base + step*n, true
+}
+
+// roundUpRangeArbitrary rounds requestedVal up to minVal+ceil((requestedVal-minVal)/step)*step
+// with arbitrary precision, for the cases the int64 fast paths cannot represent
+// without overflowing.
+func roundUpRangeArbitrary(requestedVal, minVal, step *resource.Quantity, format resource.Format) resource.Quantity {
+	added := new(inf.Dec).Sub(requestedVal.AsDec(), minVal.AsDec())
+	n := new(inf.Dec).QuoRound(added, step.AsDec(), 0, inf.RoundCeil)
+	result := new(inf.Dec).Add(minVal.AsDec(), new(inf.Dec).Mul(n, step.AsDec()))
+	return *resource.NewDecimalQuantity(*result, format)
 }
 
 // roundUpValidValues returns the first value in validValues that is greater than or equal to requestedVal.
