@@ -110,8 +110,8 @@ func CopyPodLogs(ctx context.Context, cs clientset.Interface, ns, podName string
 			FieldSelector: fmt.Sprintf("metadata.name=%s", podName),
 		}
 	}
-	// RetryWatcher reconnects internally after a blip. A plain watcher's
-	// closed result channel would otherwise busy-loop check().
+	// Use a RetryWatcher so a transient watch failure reconnects internally
+	// rather than ending the watch.
 	initialList, err := cs.CoreV1().Pods(ns).List(ctx, options)
 	if err != nil {
 		return fmt.Errorf("cannot list pods in %s: %w", ns, err)
@@ -327,9 +327,15 @@ func CopyPodLogs(ctx context.Context, cs clientset.Interface, ns, podName string
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		check()
+		resultChan := watcher.ResultChan()
 		for {
 			select {
-			case <-watcher.ResultChan():
+			case _, ok := <-resultChan:
+				if !ok {
+					// A closed channel is always ready; drop it to stop busy-looping check().
+					resultChan = nil
+					continue
+				}
 				check()
 			case <-ticker.C:
 				check()
